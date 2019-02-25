@@ -24,8 +24,10 @@ public class JgrokTest {
         Event e = new org.logstash.Event();
         e.setField("message", "55.3.244.1 GET /index.html 15824 0.043");
 
-        Collection<Event> result = jgrok.filter(Collections.singletonList(e), new TestFilterMatchListener());
+        TestFilterMatchListener matchListener = new TestFilterMatchListener();
+        Collection<Event> result = jgrok.filter(Collections.singletonList(e), matchListener);
         Assert.assertEquals(1, result.size());
+        Assert.assertEquals(1, matchListener.matchCount());
         Event resultEvent = result.stream().findFirst().get();
         Assert.assertEquals("55.3.244.1", resultEvent.getField("client") );
         Assert.assertEquals("GET", resultEvent.getField("method"));
@@ -46,8 +48,10 @@ public class JgrokTest {
         Event e = new org.logstash.Event();
         e.setField("message", apacheLog);
 
-        Collection<Event> result = jgrok.filter(Collections.singletonList(e), new TestFilterMatchListener());
+        TestFilterMatchListener matchListener = new TestFilterMatchListener();
+        Collection<Event> result = jgrok.filter(Collections.singletonList(e), matchListener);
         Assert.assertEquals(1, result.size());
+        Assert.assertEquals(1, matchListener.matchCount());
         Event resultEvent = result.stream().findFirst().get();
 
         Assert.assertEquals("GET", resultEvent.getField("verb"));
@@ -62,12 +66,35 @@ public class JgrokTest {
         Assert.assertEquals("3891", resultEvent.getField("bytes"));
         Assert.assertEquals("\"http://cadenza/xampp/navi.php\"", resultEvent.getField("referrer"));
     }
+
+    @Test
+    public void testNoMatches() {
+        String notApacheLog = "foo";
+        Map<String, Object> config = new HashMap<>();
+        config.put("match_pattern", "%{COMBINEDAPACHELOG}");
+
+        Jgrok jgrok = new Jgrok("test-jgrok", new ConfigurationImpl(config), new ContextImpl(null));
+
+        Event e = new org.logstash.Event();
+        e.setField("message", notApacheLog);
+
+        TestFilterMatchListener matchListener = new TestFilterMatchListener();
+        Collection<Event> result = jgrok.filter(Collections.singletonList(e), matchListener);
+        Assert.assertEquals(1, result.size());
+        Assert.assertEquals(0, matchListener.matchCount());
+    }
 }
 
 class TestFilterMatchListener implements FilterMatchListener {
 
+    private int matchCount;
+
     @Override
     public void filterMatched(Event event) {
-        // do nothing
+        matchCount++;
+    }
+
+    public int matchCount() {
+        return matchCount;
     }
 }

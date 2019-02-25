@@ -68,7 +68,7 @@ public class Jgrok implements Filter {
             Object source = e.getField(sourceField);
             if (source instanceof String) {
                 Map<String, Object> captures = grok.captures((String) source);
-                if (captures.size() > 0) {
+                if (captures != null && captures.size() > 0) {
                     for (Map.Entry<String, Object> entry : captures.entrySet()) {
                         e.setField(entry.getKey(), entry.getValue());
                     }
