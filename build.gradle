@@ -8,7 +8,7 @@ apply plugin: 'maven'
 apply plugin: "distribution"
 
 group 'co.elastic.logstash.plugins.filters'
-version "${new File("VERSION").text.trim()}"
+version "${file("VERSION").text.trim()}"
 
 description = "Elasticsearch ingest node filter"
 
