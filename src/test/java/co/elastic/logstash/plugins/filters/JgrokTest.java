@@ -10,7 +10,11 @@ import org.logstash.plugins.ContextImpl;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+
+import static co.elastic.logstash.plugins.filters.Jgrok.MATCH_PATTERN;
+import static co.elastic.logstash.plugins.filters.Jgrok.MAX_EXECUTION_TIME_MILLIS;
 
 public class JgrokTest {
 
@@ -29,7 +33,7 @@ public class JgrokTest {
         Assert.assertEquals(1, result.size());
         Assert.assertEquals(1, matchListener.matchCount());
         Event resultEvent = result.stream().findFirst().get();
-        Assert.assertEquals("55.3.244.1", resultEvent.getField("client") );
+        Assert.assertEquals("55.3.244.1", resultEvent.getField("client"));
         Assert.assertEquals("GET", resultEvent.getField("method"));
         Assert.assertEquals("/index.html", resultEvent.getField("request"));
         Assert.assertEquals("15824", resultEvent.getField("bytes"));
@@ -82,6 +86,26 @@ public class JgrokTest {
         Collection<Event> result = jgrok.filter(Collections.singletonList(e), matchListener);
         Assert.assertEquals(1, result.size());
         Assert.assertEquals(0, matchListener.matchCount());
+    }
+
+    @Test
+    public void testGrokTimeout() {
+        String matchPatterns = "Bonsuche mit folgender Anfrage: Belegart->\\[%{WORD:param2},(?<param5>(\\s*%{NOTSPACE})*)\\] Zustand->ABGESCHLOSSEN Kassennummer->%{WORD:param9} Bonnummer->%{WORD:param10} Datum->%{DATESTAMP_OTHER:param11}";
+        String fieldValue = "Bonsuche mit folgender Anfrage: Belegart->[EINGESCHRAENKTER_VERKAUF, VERKAUF, NACHERFASSUNG] Zustand->ABGESCHLOSSEN Kassennummer->2 Bonnummer->6362 Datum->Mon Jan 08 00:00:00 UTC 2018";
+        Map<String, Object> config = new HashMap<>();
+        config.put(MATCH_PATTERN.name(), matchPatterns);
+        config.put(MAX_EXECUTION_TIME_MILLIS.name(), 100L);
+
+        Jgrok jgrok = new Jgrok("test-jgrok", new ConfigurationImpl(config), new ContextImpl(null));
+
+        Event e1 = new org.logstash.Event();
+        e1.setField("message", fieldValue);
+        TestFilterMatchListener matchListener = new TestFilterMatchListener();
+        Collection<Event> result = jgrok.filter(Collections.singletonList(e1), matchListener);
+        Assert.assertEquals(1, result.size());
+        Assert.assertEquals(0, matchListener.matchCount());
+        List eventTags = (List) e1.getField("tags");
+        Assert.assertTrue(eventTags.contains("_groktimeout"));
     }
 }
 
