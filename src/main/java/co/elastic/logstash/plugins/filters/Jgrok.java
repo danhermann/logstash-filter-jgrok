@@ -11,7 +11,6 @@ import co.elastic.logstash.api.PluginHelper;
 import org.elasticsearch.grok.Grok;
 import org.elasticsearch.grok.ThreadWatchdog;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -26,60 +25,76 @@ import java.util.function.BiFunction;
 @LogstashPlugin(name = "jgrok")
 public class Jgrok implements Filter {
 
-    public static final PluginConfigSpec<String> SOURCE_FIELD =
-            PluginConfigSpec.stringSetting("source_field", "message");
-    public static final PluginConfigSpec<String> MATCH_PATTERN =
-            PluginConfigSpec.requiredStringSetting("match_pattern");
+    public static final PluginConfigSpec<Map<String, Object>> MATCH =
+            PluginConfigSpec.hashSetting("match", Collections.emptyMap(), false, false);
     public static final PluginConfigSpec<Long> MAX_EXECUTION_TIME_MILLIS =
             PluginConfigSpec.numSetting("max_execution_time_millis", 5000);
     public static final PluginConfigSpec<String> TAG_ON_TIMEOUT =
             PluginConfigSpec.stringSetting("tag_on_timeout", "_groktimeout");
 
-    private Grok grok;
     private String id;
-    private String sourceField;
     private String tagOnTimeout;
+    private GrokMatchEntry[] grokMatchEntries;
 
     public Jgrok(String id, Configuration config, Context context) {
-        // constructors should validate configuration options
         this.id = id;
-        this.sourceField = config.get(SOURCE_FIELD);
         this.tagOnTimeout = config.get(TAG_ON_TIMEOUT);
         Map<String, String> patternBank = Grok.getBuiltinPatterns();
+
+        // read pattern_definitions hash
+        // read patterns_file_glob from patterns_dir
         if (false) {
             patternBank.putAll(Collections.emptyMap());
         }
 
-        List<String> matchPatterns = new ArrayList<>();
-        matchPatterns.add(config.get(MATCH_PATTERN));
-
         long maxExecTimeMillis = config.get(MAX_EXECUTION_TIME_MILLIS);
-        this.grok = new Grok(
-                patternBank,
-                combinePatterns(matchPatterns),
-                createGrokThreadWatchdog(maxExecTimeMillis / 2, maxExecTimeMillis));
+        Map<String, Object> matchConfig = config.get(MATCH);
+        grokMatchEntries = new GrokMatchEntry[matchConfig.size()];
+        int k = 0;
+
+        for (Map.Entry<String, Object> entry : matchConfig.entrySet()) {
+            if (!(entry.getValue() instanceof String)) {
+                throw new IllegalArgumentException("Match pattern '" + entry.getValue() + "' must be a string type");
+            } else {
+                String patterns = (String) entry.getValue();
+                grokMatchEntries[k] = new GrokMatchEntry(
+                        entry.getKey(),
+                        new Grok(
+                                patternBank,
+                                combinePatterns(Collections.singletonList(patterns)),
+                                createGrokThreadWatchdog(maxExecTimeMillis / 2, maxExecTimeMillis))
+                        );
+            }
+            k++;
+        }
     }
 
     @Override
     public Collection<Event> filter(Collection<Event> collection, FilterMatchListener filterMatchListener) {
         for (Event e : collection) {
-            Object source = e.getField(sourceField);
-            if (source instanceof String) {
-                try {
-                    Map<String, Object> captures = grok.captures((String) source);
-                    if (captures != null && captures.size() > 0) {
-                        for (Map.Entry<String, Object> entry : captures.entrySet()) {
-                            e.setField(entry.getKey(), entry.getValue());
+            boolean matched = false;
+            for (GrokMatchEntry grok : grokMatchEntries) {
+                Object source = e.getField(grok.sourceField);
+                if (source instanceof String) {
+                    try {
+                        Map<String, Object> captures = grok.grok.captures((String) source);
+                        if (captures != null && captures.size() > 0) {
+                            for (Map.Entry<String, Object> entry : captures.entrySet()) {
+                                e.setField(entry.getKey(), entry.getValue());
+                            }
+                            matched = true;
                         }
-                        filterMatchListener.filterMatched(e);
-                    }
-                } catch (RuntimeException ex) {
-                    if (ex.getMessage().startsWith("grok pattern matching was interrupted after")) {
-                        e.tag(tagOnTimeout);
-                    } else {
-                        throw ex;
+                    } catch (RuntimeException ex) {
+                        if (ex.getMessage().startsWith("grok pattern matching was interrupted after")) {
+                            e.tag(tagOnTimeout);
+                        } else {
+                            throw ex;
+                        }
                     }
                 }
+            }
+            if (matched) {
+                filterMatchListener.filterMatched(e);
             }
         }
         return collection;
@@ -119,7 +134,7 @@ public class Jgrok implements Filter {
 
     @Override
     public Collection<PluginConfigSpec<?>> configSchema() {
-        return PluginHelper.commonFilterSettings(Arrays.asList(SOURCE_FIELD, MATCH_PATTERN, MAX_EXECUTION_TIME_MILLIS));
+        return PluginHelper.commonFilterSettings(Arrays.asList(MATCH, MAX_EXECUTION_TIME_MILLIS, TAG_ON_TIMEOUT));
     }
 
     @Override
@@ -127,48 +142,27 @@ public class Jgrok implements Filter {
         return id;
     }
 
-    /**
-     * A thread to cache millisecond time values from
-     * {@link System#nanoTime()} and {@link System#currentTimeMillis()}.
-     *
-     * The values are updated at a specified interval.
-     */
     static class CachedTimeThread extends Thread {
 
         final long interval;
         volatile boolean running = true;
         volatile long relativeMillis;
-        volatile long absoluteMillis;
 
         CachedTimeThread(String name, long interval) {
             super(name);
             this.interval = interval;
             this.relativeMillis = System.nanoTime() / 1_000_000;
-            this.absoluteMillis = System.currentTimeMillis();
             setDaemon(true);
         }
 
-        /**
-         * Return the current time used for relative calculations. This is
-         * {@link System#nanoTime()} truncated to milliseconds.
-         */
         long relativeTimeInMillis() {
             return relativeMillis;
-        }
-
-        /**
-         * Return the current epoch time, used to find absolute time. This is
-         * a cached version of {@link System#currentTimeMillis()}.
-         */
-        long absoluteTimeInMillis() {
-            return absoluteMillis;
         }
 
         @Override
         public void run() {
             while (running) {
                 relativeMillis = System.nanoTime() / 1_000_000;
-                absoluteMillis = System.currentTimeMillis();
                 try {
                     Thread.sleep(interval);
                 } catch (InterruptedException e) {
@@ -177,6 +171,17 @@ public class Jgrok implements Filter {
                 }
             }
         }
+    }
 
+    private class GrokMatchEntry {
+
+        final String sourceField;
+        final Grok grok;
+
+        GrokMatchEntry(String sourceField, Grok grok) {
+            this.sourceField = sourceField;
+            this.grok = grok;
+        }
     }
 }
+
