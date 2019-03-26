@@ -13,6 +13,7 @@ import org.elasticsearch.grok.ThreadWatchdog;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -41,10 +42,14 @@ public class Jgrok implements Filter {
             PluginConfigSpec.hashSetting("match", Collections.emptyMap(), false, false);
     public static final PluginConfigSpec<Long> TIMEOUT_MILLIS =
             PluginConfigSpec.numSetting("timeout_millis", 5000);
+    public static final PluginConfigSpec<Boolean> BREAK_ON_MATCH =
+            PluginConfigSpec.booleanSetting("break_on_match", true);
     public static final PluginConfigSpec<String> TAG_ON_TIMEOUT =
             PluginConfigSpec.stringSetting("tag_on_timeout", "_groktimeout");
     public static final PluginConfigSpec<String> TAG_ON_FAILURE =
             PluginConfigSpec.stringSetting("tag_on_failure", "_grokparsefailure");
+    public static final PluginConfigSpec<Boolean> NAMED_CAPTURES_ONLY =
+            PluginConfigSpec.booleanSetting("named_captures_only", true);
     public static final PluginConfigSpec<List<Object>> OVERWRITE =
             PluginConfigSpec.arraySetting("overwrite", Collections.emptyList(), false, false);
     public static final PluginConfigSpec<Map<String, Object>> PATTERN_DEFINITIONS =
@@ -54,14 +59,18 @@ public class Jgrok implements Filter {
     public static final PluginConfigSpec<String> PATTERNS_FILES_GLOB =
             PluginConfigSpec.stringSetting("patterns_files_glob", "*");
 
-    private String id;
-    private String tagOnTimeout;
-    private String tagOnFailure;
-    private List<String> overwrite;
-    private GrokMatchEntry[] grokMatchEntries;
+    private final String id;
+    private final boolean breakOnMatch;
+    private final boolean namedCapturesOnly;
+    private final String tagOnTimeout;
+    private final String tagOnFailure;
+    private final List<String> overwrite;
+    private final GrokMatchEntry[] grokMatchEntries;
 
     public Jgrok(String id, Configuration config, Context context) {
         this.id = id;
+        this.breakOnMatch = config.get(BREAK_ON_MATCH);
+        this.namedCapturesOnly = config.get(NAMED_CAPTURES_ONLY);
         this.tagOnTimeout = config.get(TAG_ON_TIMEOUT);
         this.tagOnFailure = config.get(TAG_ON_FAILURE);
 
@@ -102,13 +111,14 @@ public class Jgrok implements Filter {
                 throw new IllegalArgumentException("Match pattern for field '" + entry.getKey() + "' must be a string or list value");
             }
 
-            grokMatchEntries[k] = new GrokMatchEntry(
-                    entry.getKey(),
-                    new Grok(
-                            patternBank,
-                            combinePatterns(patterns),
-                            createGrokThreadWatchdog(maxExecTimeMillis / 2, maxExecTimeMillis))
-            );
+            try {
+                Constructor<Grok> constructor = Grok.class.getDeclaredConstructor(Map.class, String.class, boolean.class, ThreadWatchdog.class);
+                constructor.setAccessible(true);
+                Grok grok = constructor.newInstance(patternBank, combinePatterns(patterns), namedCapturesOnly, createGrokThreadWatchdog(maxExecTimeMillis / 2, maxExecTimeMillis));
+                grokMatchEntries[k] = new GrokMatchEntry(entry.getKey(), grok);
+            } catch (Exception ex) {
+                throw new IllegalStateException("Unable to initialize grok entry", ex);
+            }
             k++;
         }
     }
@@ -117,36 +127,73 @@ public class Jgrok implements Filter {
     public Collection<Event> filter(Collection<Event> collection, FilterMatchListener filterMatchListener) {
         for (Event e : collection) {
             boolean matched = false;
-            for (GrokMatchEntry grok : grokMatchEntries) {
+            GrokResult result = null;
+            for (int k = 0; k < grokMatchEntries.length && (!breakOnMatch || !matched); k++) {
+                GrokMatchEntry grok = grokMatchEntries[k];
                 Object source = e.getField(grok.sourceField);
                 if (source instanceof String) {
-                    try {
-                        Map<String, Object> captures = grok.grok.captures((String) source);
-                        if (captures != null && captures.size() > 0) {
-                            for (Map.Entry<String, Object> entry : captures.entrySet()) {
-                                final String targetField = entry.getKey();
-                                if (e.getField(targetField) == null || overwrite.contains(targetField)) {
-                                    e.setField(targetField, entry.getValue());
-                                }
+                    result = grok(grok.grok, (String) source);
+                    if (result.timedOut) {
+                        e.tag(tagOnTimeout);
+                    } else if (result.captures != null && result.captures.size() > 0) {
+                        for (Map.Entry<String, Object> entry : result.captures.entrySet()) {
+                            final String targetField = entry.getKey();
+                            if (e.getField(targetField) == null || overwrite.contains(targetField)) {
+                                e.setField(targetField, entry.getValue());
                             }
-                            matched = true;
                         }
-                    } catch (RuntimeException ex) {
-                        if (ex.getMessage().startsWith("grok pattern matching was interrupted after")) {
-                            e.tag(tagOnTimeout);
-                        } else {
-                            throw ex;
+                        matched = true;
+                    }
+                } else if (source instanceof List) {
+                    List sourceList = (List) source;
+                    Map<String, List<Object>> values = new HashMap<>();
+                    for (Object item : sourceList) {
+                        if (item instanceof String) {
+                            result = grok(grok.grok, (String) item);
+                            if (result.timedOut) {
+                                e.tag(tagOnTimeout);
+                            } else if (result.captures != null && result.captures.size() > 0) {
+                                for (Map.Entry<String, Object> entry : result.captures.entrySet()) {
+                                    appendValue(values, entry.getKey(), entry.getValue());
+                                }
+                                matched = true;
+                            }
+                        }
+                    }
+                    for (Map.Entry<String, List<Object>> entry : values.entrySet()) {
+                        final String targetField = entry.getKey();
+                        if (e.getField(targetField) == null || overwrite.contains(targetField)) {
+                            e.setField(targetField, entry.getValue());
                         }
                     }
                 }
             }
             if (matched) {
                 filterMatchListener.filterMatched(e);
-            } else if (tagOnFailure != null && !tagOnFailure.equals("")) {
+            } else if (result != null && !result.timedOut && tagOnFailure != null && !tagOnFailure.equals("")) {
                 e.tag(tagOnFailure);
             }
         }
         return collection;
+    }
+
+    private static GrokResult grok(Grok grok, String source) {
+        GrokResult result = new GrokResult();
+        try {
+            result.captures = grok.captures(source);
+        } catch (RuntimeException ex) {
+            if (ex.getMessage().startsWith("grok pattern matching was interrupted after")) {
+                result.timedOut = true;
+            } else {
+                throw ex;
+            }
+        }
+        return result;
+    }
+
+    private static void appendValue(Map<String, List<Object>> values, String key, Object value) {
+        List<Object> valuesList = values.computeIfAbsent(key, k -> new ArrayList<>());
+        valuesList.add(value);
     }
 
     private static String combinePatterns(List<String> patterns) {
@@ -228,8 +275,9 @@ public class Jgrok implements Filter {
 
     @Override
     public Collection<PluginConfigSpec<?>> configSchema() {
-        return PluginHelper.commonFilterSettings(Arrays.asList(MATCH, TIMEOUT_MILLIS, TAG_ON_TIMEOUT,
-                TAG_ON_FAILURE, OVERWRITE, PATTERN_DEFINITIONS, PATTERNS_DIR, PATTERNS_FILES_GLOB));
+        return PluginHelper.commonFilterSettings(Arrays.asList(MATCH, TIMEOUT_MILLIS, BREAK_ON_MATCH, TAG_ON_TIMEOUT,
+                TAG_ON_FAILURE, NAMED_CAPTURES_ONLY, OVERWRITE, PATTERN_DEFINITIONS, PATTERNS_DIR,
+                PATTERNS_FILES_GLOB));
     }
 
     @Override
@@ -301,5 +349,10 @@ public class Jgrok implements Filter {
         public FileVisitResult visitFileFailed(Path file, IOException ex) {
             return FileVisitResult.TERMINATE;
         }
+    }
+
+    private static class GrokResult {
+        Map<String, Object> captures;
+        boolean timedOut;
     }
 }

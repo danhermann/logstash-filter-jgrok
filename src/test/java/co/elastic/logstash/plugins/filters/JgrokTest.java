@@ -20,6 +20,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static co.elastic.logstash.plugins.filters.Jgrok.BREAK_ON_MATCH;
 import static co.elastic.logstash.plugins.filters.Jgrok.MATCH;
 import static co.elastic.logstash.plugins.filters.Jgrok.OVERWRITE;
 import static co.elastic.logstash.plugins.filters.Jgrok.PATTERNS_DIR;
@@ -134,12 +135,11 @@ public class JgrokTest {
     @Test
     public void testMultipleMatchesInSingleEvent() {
         Map<String, Object> config = new HashMap<>();
-
-
         Map<String, String> matches = new HashMap<>();
         matches.put("message1", "%{IP:client1} %{WORD:method1} %{URIPATHPARAM:request1} %{NUMBER:bytes1} %{NUMBER:duration1}");
         matches.put("message2", "%{COMBINEDAPACHELOG}");
         config.put(MATCH.name(), matches);
+        config.put(BREAK_ON_MATCH.name(), false);
 
         Jgrok jgrok = new Jgrok("test-jgrok", new ConfigurationImpl(config), new ContextImpl(null));
         Event e = new org.logstash.Event();
@@ -172,6 +172,7 @@ public class JgrokTest {
         Assert.assertEquals(1, result.size());
         Assert.assertEquals(0, matchListener.matchCount());
         assertHasTag(e1, "_groktimeout");
+        assertDoesNotHaveTag(e1, "_grokparsefailure");
     }
 
     @Test
@@ -237,8 +238,8 @@ public class JgrokTest {
             TestFilterMatchListener matchListener = new TestFilterMatchListener();
             jgrok.filter(Collections.singletonList(e), matchListener);
             Assert.fail("Glob pattern should have excluded pattern2.conf file");
-        } catch (IllegalArgumentException ex) {
-            if (!ex.getMessage().equals("Unable to find pattern [TESTPATTERN2] in Grok's pattern dictionary")) {
+        } catch (IllegalStateException ex) {
+            if (!ex.getCause().getCause().getMessage().equals("Unable to find pattern [TESTPATTERN2] in Grok's pattern dictionary")) {
                 Assert.fail("Unexpected exception encountered: " + ex);
             }
         } finally {
@@ -311,9 +312,18 @@ public class JgrokTest {
         }
     }
 
-    private static void assertHasTag(Event e, String tag) {
+    static void assertHasTag(Event e, String tag) {
         List eventTags = (List) e.getField("tags");
         Assert.assertTrue(eventTags.contains(tag));
+    }
+
+    static void assertDoesNotHaveTag(Event e, String tag) {
+        List eventTags = (List) e.getField("tags");
+        Assert.assertFalse(eventTags.contains(tag));
+    }
+
+    static void assertNoTags(Event e) {
+        Assert.assertNull(e.getField("tags"));
     }
 
     private static void validateSimpleLogLine(Event e) {
